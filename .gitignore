@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.pkl
+data/df_supply_clean.csv
+.pytest_cache/

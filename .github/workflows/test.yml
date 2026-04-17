@@ -1,0 +1,39 @@
+name: SupplyPredict API Tests
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Copy data files
+        run: |
+          mkdir -p data
+          # En CI los datos van como artifacts o se generan con mock
+          cp tests/mock_data/reorder_points.csv data/ 2>/dev/null || echo "Usando mock data"
+          cp tests/mock_data/predictions.pkl data/ 2>/dev/null || echo "Usando mock data"
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v --tb=short
+
+      - name: Coverage report
+        run: |
+          pytest tests/ --cov=main --cov-report=term-missing
