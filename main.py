@@ -216,6 +216,104 @@ def categorias():
     cats = sorted(set(r.get('categoria','') for r in _raw_rows if r.get('categoria')))
     return {"categorias": cats}
 
+# ── /ping - keep-alive para evitar Render sleep ────────────────────────
+from datetime import datetime, timezone
+_start_time = datetime.now(timezone.utc)
+
+@app.get("/ping")
+def ping():
+    """Endpoint ligero para UptimeRobot - evita que Render duerma la instancia."""
+    uptime = (datetime.now(timezone.utc) - _start_time).total_seconds()
+    return {
+        "status": "ok",
+        "uptime_seconds": int(uptime),
+        "uptime_hours": round(uptime / 3600, 2),
+    }
+
+# ── /export/alerts - descargar CSV de productos con alerta ─────────────
+from fastapi.responses import Response
+
+@app.get("/export/alerts")
+def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None):
+    """
+    Devuelve CSV con productos que requieren acción.
+    Por defecto: CRÍTICO + URGENTE. Filtrable por status y categoría.
+    """
+    if not _raw_rows:
+        raise HTTPException(503, "Datos no disponibles")
+
+    key = 'status_consolidado' if _enriched else 'status'
+
+    # Por defecto: alertas (críticos + urgentes), excluye normales y con orden abierta
+    if status:
+        filtered = [r for r in _raw_rows if r.get(key,'').upper() == status.upper()]
+    else:
+        filtered = [r for r in _raw_rows if r.get(key) in ('CRÍTICO', 'URGENTE')]
+
+    if categoria:
+        filtered = [r for r in filtered if r.get('categoria','').lower() == categoria.lower()]
+
+    # Ordenar por criticidad (status) y stock negativo primero
+    def sort_key(r):
+        status_order = {'CRÍTICO': 0, 'URGENTE': 1, 'ORDEN_ABIERTA': 2, 'NORMAL': 3}
+        s = r.get(key, 'NORMAL')
+        stock = _float(r.get('stock_consolidado') or r.get('current_stock'))
+        return (status_order.get(s, 9), stock)
+
+    filtered = sorted(filtered, key=sort_key)
+
+    # Construir CSV en memoria
+    import io
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Headers
+    writer.writerow([
+        'ID Producto', 'Nombre', 'Categoria', 'Proveedor',
+        'Stock GDL', 'Stock Consolidado', 'Stock Minimo',
+        'Lead Time (dias)', 'Venta Diaria Promedio', 'Dias de Cobertura',
+        'Cantidad Sugerida', 'Status', 'Orden Abierta',
+        'ID Orden', 'Fecha Llegada Orden',
+    ])
+
+    # Filas
+    for r in filtered:
+        status_val = _str(r.get('status_consolidado') or r.get('status'), 'NORMAL')
+        writer.writerow([
+            r.get('product_id', ''),
+            _str(r.get('nombre'), r.get('product_id', '')),
+            _str(r.get('categoria'), ''),
+            _str(r.get('proveedor') or r.get('proveedor_principal'), ''),
+            int(_float(r.get('current_stock'))),
+            int(_float(r.get('stock_consolidado'))),
+            int(_float(r.get('stock_minimo') or r.get('reorder_point'))),
+            int(_float(r.get('lead_time_days'))),
+            round(_float(r.get('avg_daily_sales')), 2),
+            int(_float(r.get('days_coverage'), 0)),
+            int(_float(r.get('qty_recommended'))),
+            status_val,
+            'SI' if _str(r.get('orden_id')) else 'NO',
+            _str(r.get('orden_id'), ''),
+            _str(r.get('orden_fecha_llegada'), ''),
+        ])
+
+    csv_content = output.getvalue()
+    output.close()
+
+    # Nombre del archivo con fecha
+    from datetime import date
+    filename = f"supplypredict_alertas_{date.today().isoformat()}.csv"
+
+    # BOM para que Excel abra bien el UTF-8 con acentos
+    return Response(
+        content='\ufeff' + csv_content,
+        media_type='text/csv; charset=utf-8',
+        headers={
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Content-Type': 'text/csv; charset=utf-8',
+        },
+    )
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
