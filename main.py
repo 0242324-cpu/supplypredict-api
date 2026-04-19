@@ -219,3 +219,39 @@ def categorias():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# ── /metrics ──────────────────────────────────────────────────────────
+@app.get("/metrics")
+def metrics():
+    import csv as csv_mod
+    rows = []
+    try:
+        with open("data/model_metrics.csv", newline='', encoding='utf-8') as f:
+            for r in csv_mod.DictReader(f):
+                mape = _float(r.get('mape'), 999)
+                rows.append({
+                    "product_id":  r["product_id"],
+                    "n_obs":       int(_float(r.get('n_obs'), 0)),
+                    "mae":         _float(r.get('mae')),
+                    "rmse":        _float(r.get('rmse')),
+                    "mape":        mape,
+                    "avg_sales":   _float(r.get('avg_sales')),
+                    "mae_pct":     _float(r.get('mae_pct')),
+                    "grade": ("A" if mape < 20 else
+                              "B" if mape < 50 else
+                              "C" if mape < 100 else "D"),
+                })
+    except Exception as e:
+        raise HTTPException(503, f"Métricas no disponibles: {e}")
+
+    grades = {"A":0,"B":0,"C":0,"D":0}
+    for r in rows: grades[r["grade"]] += 1
+    mapes = [r["mape"] for r in rows if r["mape"] < 500]
+
+    return {
+        "total":         len(rows),
+        "mape_median":   round(sorted(mapes)[len(mapes)//2], 1) if mapes else None,
+        "mape_mean":     round(sum(mapes)/len(mapes), 1) if mapes else None,
+        "grades":        grades,
+        "products":      sorted(rows, key=lambda x: x["mape"]),
+    }
