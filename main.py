@@ -3,10 +3,12 @@ SupplyPredict API - main.py
 Soporta datos básicos y datos enriquecidos (catálogo + multi-almacén + órdenes)
 Para hacer swap: reemplazar archivos en data/ y reiniciar el servicio
 """
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-import os, pickle, csv, math
+from fastapi.responses import Response, JSONResponse
+import os, pickle, csv, math, json, io
 from typing import Optional
+from datetime import datetime, timezone, date
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -59,6 +61,18 @@ else:
 _predictions    = _load_pkl(PRED_PATH)
 _products_index = {r["product_id"]: r for r in _raw_rows}
 
+# ── Cargar nombres de productos ──────────────────────────────────────
+NAMES_PATH = os.getenv("PRODUCT_NAMES_PATH", "data/product_names.json")
+_product_names = {}
+try:
+    with open(NAMES_PATH, "r", encoding="utf-8") as f:
+        _product_names = json.load(f)
+    print(f"✓ {NAMES_PATH}: {len(_product_names)} nombres")
+except FileNotFoundError:
+    print(f"⚠ {NAMES_PATH} no encontrado — nombres vacíos")
+except Exception as e:
+    print(f"✗ {NAMES_PATH}: {e}")
+
 # ── App ──────────────────────────────────────────────────────────────
 app = FastAPI(title="SupplyPredict API", version="2.0.0")
 app.add_middleware(
@@ -74,8 +88,8 @@ def row_to_dict(r):
     stock  = _float(r.get('stock_consolidado') or r.get('current_stock'))
     return {
         "product_id":          r["product_id"],
-        # Enriquecidos (None si no hay catálogo)
-        "nombre":              _str(r.get('nombre'), r["product_id"]),
+        # Nombre: prioridad → product_names.json > CSV nombre > product_id
+        "nombre":              _product_names.get(r["product_id"]) or _str(r.get('nombre'), r["product_id"]),
         "categoria":           _str(r.get('categoria'), 'Sin categoría'),
         "unidad":              _str(r.get('unidad'), ''),
         "proveedor":           _str(r.get('proveedor') or r.get('proveedor_principal'), ''),
@@ -106,9 +120,11 @@ def get_sorted(status=None, search=None, categoria=None):
         key = 'status_consolidado' if _enriched else 'status'
         rows = [r for r in rows if r.get(key,'').upper() == status.upper()]
     if search:
+        sl = search.lower()
         rows = [r for r in rows
-                if search.lower() in r.get("product_id","").lower()
-                or search.lower() in r.get("nombre","").lower()]
+                if sl in r.get("product_id","").lower()
+                or sl in r.get("nombre","").lower()
+                or sl in _product_names.get(r.get("product_id",""),"").lower()]
     if categoria:
         rows = [r for r in rows if r.get("categoria","").lower() == categoria.lower()]
 
@@ -217,7 +233,6 @@ def categorias():
     return {"categorias": cats}
 
 # ── /ping - keep-alive para evitar Render sleep ────────────────────────
-from datetime import datetime, timezone
 _start_time = datetime.now(timezone.utc)
 
 @app.get("/ping")
@@ -231,7 +246,6 @@ def ping():
     }
 
 # ── /export/alerts - descargar CSV de productos con alerta ─────────────
-from fastapi.responses import Response
 
 @app.get("/export/alerts")
 def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None):
@@ -263,7 +277,6 @@ def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None)
     filtered = sorted(filtered, key=sort_key)
 
     # Construir CSV en memoria
-    import io
     output = io.StringIO()
     writer = csv.writer(output)
 
@@ -279,9 +292,10 @@ def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None)
     # Filas
     for r in filtered:
         status_val = _str(r.get('status_consolidado') or r.get('status'), 'NORMAL')
+        pid = r.get('product_id', '')
         writer.writerow([
-            r.get('product_id', ''),
-            _str(r.get('nombre'), r.get('product_id', '')),
+            pid,
+            _product_names.get(pid) or _str(r.get('nombre'), pid),
             _str(r.get('categoria'), ''),
             _str(r.get('proveedor') or r.get('proveedor_principal'), ''),
             int(_float(r.get('current_stock'))),
@@ -301,7 +315,6 @@ def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None)
     output.close()
 
     # Nombre del archivo con fecha
-    from datetime import date
     filename = f"supplypredict_alertas_{date.today().isoformat()}.csv"
 
     # BOM para que Excel abra bien el UTF-8 con acentos
@@ -321,14 +334,14 @@ if __name__ == "__main__":
 # ── /metrics ──────────────────────────────────────────────────────────
 @app.get("/metrics")
 def metrics():
-    import csv as csv_mod
     rows = []
     try:
         with open("data/model_metrics.csv", newline='', encoding='utf-8') as f:
-            for r in csv_mod.DictReader(f):
+            for r in csv.DictReader(f):
                 mape = _float(r.get('mape'), 999)
                 rows.append({
                     "product_id":  r["product_id"],
+                    "nombre":      _product_names.get(r["product_id"], r["product_id"]),
                     "n_obs":       int(_float(r.get('n_obs'), 0)),
                     "mae":         _float(r.get('mae')),
                     "rmse":        _float(r.get('rmse')),
@@ -353,3 +366,59 @@ def metrics():
         "grades":        grades,
         "products":      sorted(rows, key=lambda x: x["mape"]),
     }
+
+# ── /product-names — mapeo completo de códigos → nombres ─────────────
+@app.get("/product-names")
+def product_names():
+    return {
+        "total": len(_product_names),
+        "names": _product_names,
+    }
+
+# ── /upload-sales — recibir CSV de ventas y actualizar nombres ───────
+@app.post("/upload-sales")
+async def upload_sales(file: UploadFile = File(...)):
+    global _product_names
+
+    if not file.filename.endswith('.csv'):
+        return JSONResponse(status_code=400, content={"detail": "Solo se aceptan archivos .csv"})
+
+    try:
+        content = await file.read()
+        text = content.decode('utf-8-sig')
+        reader = csv.DictReader(io.StringIO(text))
+
+        fieldnames = [f.strip() for f in (reader.fieldnames or [])]
+        required = ['CODIGO_PRODUCTO', 'DESCRIPCION_PRODUCTO', 'CANTIDAD TOTAL']
+        missing = [c for c in required if c not in fieldnames]
+        if missing:
+            return JSONResponse(status_code=400, content={"detail": f"Columnas faltantes: {', '.join(missing)}"})
+
+        new_names = {}
+        for row in reader:
+            code = row.get('CODIGO_PRODUCTO', '').strip()
+            desc = row.get('DESCRIPCION_PRODUCTO', '').strip()
+            if code and desc:
+                new_names[code] = desc
+
+        names_updated = sum(1 for c, n in new_names.items() if _product_names.get(c) != n)
+        _product_names.update(new_names)
+
+        with open(NAMES_PATH, "w", encoding="utf-8") as f:
+            json.dump(_product_names, f, ensure_ascii=False, indent=2)
+        print(f"✓ product_names actualizado: {len(_product_names)} total, {names_updated} nuevos/cambios")
+
+        existing_ids = set(_products_index.keys())
+        uploaded_ids = set(new_names.keys())
+
+        return {
+            "status":              "ok",
+            "products_processed":  len(new_names),
+            "names_updated":       names_updated,
+            "matched":             len(uploaded_ids & existing_ids),
+            "unmatched":           len(uploaded_ids - existing_ids),
+            "total_names_in_system": len(_product_names),
+            "file":                file.filename,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"Error procesando archivo: {str(e)}"})
