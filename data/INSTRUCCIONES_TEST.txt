@@ -1,0 +1,124 @@
+
+╔══════════════════════════════════════════════════════════════════╗
+║  INSTRUCCIONES DE PRUEBA DEL PIPELINE DE REENTRENAMIENTO       ║
+║  Generado: 2026-05-15 04:41                                   ║
+╚══════════════════════════════════════════════════════════════════╝
+
+ARCHIVOS GENERADOS:
+  1. PROBANDO_PIPELINE_SINTETICO.csv  → Para subir en la pestaña "Carga de datos"
+  2. df_supply_clean_SINTETICO.csv    → Reemplaza df_supply_clean.csv para reentrenar
+  3. ROLLBACK_ESTADO_ACTUAL.csv       → Backup del original (restaurar después)
+
+═══════════════════════════════════════════════════════════════════
+  PASO 1: HACER BACKUP (ANTES DE CUALQUIER COSA)
+═══════════════════════════════════════════════════════════════════
+
+  El archivo ROLLBACK_ESTADO_ACTUAL.csv ya fue generado como backup.
+  TAMBIÉN descarga el df_supply_clean.csv actual del repositorio:
+
+    git clone https://github.com/0242324-cpu/supplypredict-api.git /tmp/backup
+    cp /tmp/backup/data/df_supply_clean.csv ./df_supply_clean_BACKUP_FISICO.csv
+
+  Esto es tu "punto de restauración" real.
+
+═══════════════════════════════════════════════════════════════════
+  PASO 2: PROBAR EL PIPELINE SINTÉTICO
+═══════════════════════════════════════════════════════════════════
+
+  Opción A — Vía Frontend (recomendado):
+  ────────────────────────────────────────
+  1. Primero, reemplaza el histórico para que train.py vea los datos nuevos:
+
+     cp data/df_supply_clean.csv data/df_supply_clean_BACKUP.csv
+     cp data/df_supply_clean_SINTETICO.csv data/df_supply_clean.csv
+
+  2. Abre https://supplypredict-web.vercel.app → Pestaña "Carga de datos"
+  3. Sube PROBANDO_PIPELINE_SINTETICO.csv
+  4. Activa el toggle "Reentrenar modelo con estos datos"
+  5. Click "🧠 Subir y reentrenar"
+  6. Espera ~2.5 minutos (verás el spinner)
+  7. Revisa el resultado en el panel
+
+  Opción B — Manual:
+  ────────────────────
+  1. cp data/df_supply_clean_SINTETICO.csv data/df_supply_clean.csv
+  2. python train.py
+  3. Revisa data/model_metrics.csv
+
+═══════════════════════════════════════════════════════════════════
+  PASO 3: QUÉ OBSERVAR EN EL DASHBOARD
+═══════════════════════════════════════════════════════════════════
+
+  Después del reentrenamiento, abre el Dashboard y busca estos cambios:
+
+  A) En la página de MÉTRICAS:
+     - La MAPE mediana puede SUBIR (porque el pico artificial es ruido)
+     - Los productos top 10 deben mostrar un MAPE diferente al actual
+     - Puede haber más productos en Grado D (el pico distorsiona)
+
+  B) En la página de DETALLE de cualquiera de estos productos:
+     -      • SE-ARR101-0838
+     • SE-ARR101-0836
+     • CO-PDM458-9766
+     • SE-HYE403-1980
+     • RE-FVL350-9655
+     • SE-SAL502-0788
+     • SE-PDM450-1909
+     • SE-PDM450-1910
+     • SE-SYE599-2023
+     • SE-SAL502-1936
+
+     El gráfico de Forecast debe mostrar VALORES MÁS ALTOS que antes,
+     porque el modelo aprendió las 2 semanas de ventas al 300%.
+
+  C) En la página DASHBOARD:
+     - Las alertas pueden cambiar porque el reorder_point se recalcula
+       con la nueva demanda más alta.
+     - Más productos en CRÍTICO (stock no alcanza para demanda 3x).
+
+═══════════════════════════════════════════════════════════════════
+  PASO 4: ROLLBACK (RESTAURAR ESTADO ORIGINAL)
+═══════════════════════════════════════════════════════════════════
+
+  Para volver al estado original:
+
+  1. Restaurar datos:
+     cp data/ROLLBACK_ESTADO_ACTUAL.csv data/df_supply_clean.csv
+
+  2. Reentrenar con datos originales:
+     python train.py
+
+  3. Push resultados:
+     git add data/predictions.pkl data/model_metrics.csv data/reorder_points.csv data/df_supply_clean.csv
+     git commit -m "rollback: restaurar datos originales post-prueba"
+     git push origin main
+
+  Resultado esperado tras rollback:
+     MAPE mediana:  ~41.8%
+     Grado A:       ~76
+     Grado D:       ~91
+
+═══════════════════════════════════════════════════════════════════
+  DATOS DEL PICO SINTÉTICO
+═══════════════════════════════════════════════════════════════════
+
+  Factor de inflación:    300% del promedio histórico
+  Semanas agregadas:      2
+  Productos afectados:    10
+  Fechas nuevas:          2026-04-06 → 2026-04-13
+  Filas sintéticas:       20
+
+  ¿POR QUÉ EL MODELO LO DETECTA?
+  LightGBM v2.0 usa lag_1w y lag_2w como features principales.
+  Un pico de 300% en las últimas 2 semanas crea lags que son 3x más
+  altos que la media histórica. Los rolling_mean (4w, 8w) y
+  expanding_mean se arrastran hacia arriba por estos puntos extremos,
+  forzando al modelo a proyectar demanda más alta en el forecast.
+
+═══════════════════════════════════════════════════════════════════
+  ⚠ IMPORTANTE
+═══════════════════════════════════════════════════════════════════
+
+  Estos datos son SINTÉTICOS para prueba. NO representan ventas reales.
+  SIEMPRE haz rollback después de probar.
+  El archivo ROLLBACK_ESTADO_ACTUAL.csv es tu seguro de vida.
