@@ -1,12 +1,12 @@
 """
-SupplyPredict API - main.py v3.0
+SupplyPredict API - main.py
 Soporta datos básicos y datos enriquecidos (catálogo + multi-almacén + órdenes)
-Nuevo: upload-sales con reentrenamiento automático en background
+Para hacer swap: reemplazar archivos en data/ y reiniciar el servicio
 """
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
-import os, pickle, csv, math, json, io, subprocess, gc, traceback
+import os, pickle, csv, math, json, io
 from typing import Optional
 from datetime import datetime, timezone, date
 from dotenv import load_dotenv
@@ -14,33 +14,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Configuración de paths ────────────────────────────────────────────
-FULL_PATH  = os.getenv("FULL_DATA_PATH",     "data/reorder_points_full.csv")
-BASE_PATH  = os.getenv("REORDER_POINTS_PATH", "data/reorder_points.csv")
-PRED_PATH  = os.getenv("PREDICTIONS_PATH",    "data/predictions.pkl")
-SUPPLY_CSV = os.getenv("SUPPLY_CSV_PATH",     "data/df_supply_clean.csv")
-NAMES_PATH = os.getenv("PRODUCT_NAMES_PATH",  "data/product_names.json")
+# Modo enriquecido si existe reorder_points_full.csv, si no usa el básico
+FULL_PATH = os.getenv("FULL_DATA_PATH",    "data/reorder_points_full.csv")
+BASE_PATH = os.getenv("REORDER_POINTS_PATH","data/reorder_points.csv")
+PRED_PATH = os.getenv("PREDICTIONS_PATH",   "data/predictions.pkl")
 
-# ── Estado global de entrenamiento ────────────────────────────────────
-_training_state = {
-    "status": "idle",        # idle | queued | running | completed | error
-    "started_at": None,
-    "finished_at": None,
-    "message": "",
-    "result": None,          # {mape_median, mape_mean, grades, products_trained}
-    "error": None,
-}
-
-def _reset_training_state():
-    _training_state.update({
-        "status": "idle",
-        "started_at": None,
-        "finished_at": None,
-        "message": "",
-        "result": None,
-        "error": None,
-    })
-
-# ── Helpers genéricos ─────────────────────────────────────────────────
 def _load_csv(path):
     rows = []
     try:
@@ -70,6 +48,7 @@ def _str(v, default=''):
     return v if v and v not in ('nan','None','NaN') else default
 
 # ── Cargar datos al iniciar ───────────────────────────────────────────
+# Intenta cargar el CSV enriquecido primero
 if os.path.exists(FULL_PATH):
     _raw_rows   = _load_csv(FULL_PATH)
     _enriched   = True
@@ -83,6 +62,7 @@ _predictions    = _load_pkl(PRED_PATH)
 _products_index = {r["product_id"]: r for r in _raw_rows}
 
 # ── Cargar nombres de productos ──────────────────────────────────────
+NAMES_PATH = os.getenv("PRODUCT_NAMES_PATH", "data/product_names.json")
 _product_names = {}
 try:
     with open(NAMES_PATH, "r", encoding="utf-8") as f:
@@ -93,24 +73,8 @@ except FileNotFoundError:
 except Exception as e:
     print(f"✗ {NAMES_PATH}: {e}")
 
-# ── Función para recargar datos después de reentrenamiento ────────────
-def _reload_data():
-    """Recarga todos los datos en memoria después de un reentrenamiento."""
-    global _raw_rows, _enriched, _predictions, _products_index
-
-    if os.path.exists(FULL_PATH):
-        _raw_rows = _load_csv(FULL_PATH)
-        _enriched = True
-    else:
-        _raw_rows = _load_csv(BASE_PATH)
-        _enriched = False
-
-    _predictions = _load_pkl(PRED_PATH)
-    _products_index = {r["product_id"]: r for r in _raw_rows}
-    print(f"✓ Datos recargados: {len(_raw_rows)} productos, {len(_predictions)} predicciones")
-
 # ── App ──────────────────────────────────────────────────────────────
-app = FastAPI(title="SupplyPredict API", version="3.0.0")
+app = FastAPI(title="SupplyPredict API", version="2.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -124,10 +88,12 @@ def row_to_dict(r):
     stock  = _float(r.get('stock_consolidado') or r.get('current_stock'))
     return {
         "product_id":          r["product_id"],
+        # Nombre: prioridad → product_names.json > CSV nombre > product_id
         "nombre":              _product_names.get(r["product_id"]) or _str(r.get('nombre'), r["product_id"]),
         "categoria":           _str(r.get('categoria'), 'Sin categoría'),
         "unidad":              _str(r.get('unidad'), ''),
         "proveedor":           _str(r.get('proveedor') or r.get('proveedor_principal'), ''),
+        # Stock
         "current_stock":       _float(r.get('current_stock')),
         "stock_consolidado":   stock,
         "reorder_point":       _float(r.get('reorder_point')),
@@ -138,11 +104,13 @@ def row_to_dict(r):
         "status":              status,
         "qty_recommended":     _float(r.get('qty_recommended')),
         "forecast_next_30d":   _float(r.get('forecast_next_30d')) if r.get('forecast_next_30d') else None,
+        # Orden abierta
         "orden_abierta":       bool(_str(r.get('orden_id'))),
         "orden_id":            _str(r.get('orden_id')),
         "orden_cantidad":      _float(r.get('orden_cantidad')) if r.get('orden_cantidad') else None,
         "orden_fecha_llegada": _str(r.get('orden_fecha_llegada')),
         "orden_proveedor":     _str(r.get('orden_proveedor')),
+        # Meta
         "enriched":            _enriched,
     }
 
@@ -167,11 +135,7 @@ def get_sorted(status=None, search=None, categoria=None):
 
     return sorted(rows, key=sort_key)
 
-
-# ══════════════════════════════════════════════════════════════════════
-# ENDPOINTS EXISTENTES (sin cambios funcionales)
-# ══════════════════════════════════════════════════════════════════════
-
+# ── ENDPOINTS ─────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {
@@ -180,7 +144,6 @@ def health():
         "products_loaded":  len(_raw_rows),
         "forecasts_loaded": len(_predictions),
         "mode":             "enriched" if _enriched else "basic",
-        "training_status":  _training_state["status"],
     }
 
 @app.get("/dashboard")
@@ -191,6 +154,8 @@ def dashboard():
     urgent        = [r for r in _raw_rows if r.get(key) == 'URGENTE']
     orden_abierta = [r for r in _raw_rows if r.get(key) == 'ORDEN_ABIERTA']
     top           = get_sorted()[:10]
+
+    # Categorías disponibles
     categorias = sorted(set(r.get('categoria','') for r in _raw_rows if r.get('categoria')))
 
     return {
@@ -267,10 +232,12 @@ def categorias():
     cats = sorted(set(r.get('categoria','') for r in _raw_rows if r.get('categoria')))
     return {"categorias": cats}
 
+# ── /ping - keep-alive para evitar Render sleep ────────────────────────
 _start_time = datetime.now(timezone.utc)
 
 @app.get("/ping")
 def ping():
+    """Endpoint ligero para UptimeRobot - evita que Render duerma la instancia."""
     uptime = (datetime.now(timezone.utc) - _start_time).total_seconds()
     return {
         "status": "ok",
@@ -278,18 +245,29 @@ def ping():
         "uptime_hours": round(uptime / 3600, 2),
     }
 
+# ── /export/alerts - descargar CSV de productos con alerta ─────────────
+
 @app.get("/export/alerts")
 def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None):
+    """
+    Devuelve CSV con productos que requieren acción.
+    Por defecto: CRÍTICO + URGENTE. Filtrable por status y categoría.
+    """
     if not _raw_rows:
         raise HTTPException(503, "Datos no disponibles")
+
     key = 'status_consolidado' if _enriched else 'status'
+
+    # Por defecto: alertas (críticos + urgentes), excluye normales y con orden abierta
     if status:
         filtered = [r for r in _raw_rows if r.get(key,'').upper() == status.upper()]
     else:
         filtered = [r for r in _raw_rows if r.get(key) in ('CRÍTICO', 'URGENTE')]
+
     if categoria:
         filtered = [r for r in filtered if r.get('categoria','').lower() == categoria.lower()]
 
+    # Ordenar por criticidad (status) y stock negativo primero
     def sort_key(r):
         status_order = {'CRÍTICO': 0, 'URGENTE': 1, 'ORDEN_ABIERTA': 2, 'NORMAL': 3}
         s = r.get(key, 'NORMAL')
@@ -297,8 +275,12 @@ def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None)
         return (status_order.get(s, 9), stock)
 
     filtered = sorted(filtered, key=sort_key)
+
+    # Construir CSV en memoria
     output = io.StringIO()
     writer = csv.writer(output)
+
+    # Headers
     writer.writerow([
         'ID Producto', 'Nombre', 'Categoria', 'Proveedor',
         'Stock GDL', 'Stock Consolidado', 'Stock Minimo',
@@ -306,6 +288,8 @@ def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None)
         'Cantidad Sugerida', 'Status', 'Orden Abierta',
         'ID Orden', 'Fecha Llegada Orden',
     ])
+
+    # Filas
     for r in filtered:
         status_val = _str(r.get('status_consolidado') or r.get('status'), 'NORMAL')
         pid = r.get('product_id', '')
@@ -326,9 +310,14 @@ def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None)
             _str(r.get('orden_id'), ''),
             _str(r.get('orden_fecha_llegada'), ''),
         ])
+
     csv_content = output.getvalue()
     output.close()
+
+    # Nombre del archivo con fecha
     filename = f"supplypredict_alertas_{date.today().isoformat()}.csv"
+
+    # BOM para que Excel abra bien el UTF-8 con acentos
     return Response(
         content='\ufeff' + csv_content,
         media_type='text/csv; charset=utf-8',
@@ -338,6 +327,11 @@ def export_alerts(status: Optional[str] = None, categoria: Optional[str] = None)
         },
     )
 
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# ── /metrics ──────────────────────────────────────────────────────────
 @app.get("/metrics")
 def metrics():
     rows = []
@@ -373,135 +367,21 @@ def metrics():
         "products":      sorted(rows, key=lambda x: x["mape"]),
     }
 
+# ── /product-names — mapeo completo de códigos → nombres ─────────────
 @app.get("/product-names")
 def product_names():
-    return { "total": len(_product_names), "names": _product_names }
+    return {
+        "total": len(_product_names),
+        "names": _product_names,
+    }
 
-
-# ══════════════════════════════════════════════════════════════════════
-# NUEVO: REENTRENAMIENTO AUTOMÁTICO
-# ══════════════════════════════════════════════════════════════════════
-
-def _run_retrain_pipeline():
-    """
-    Background task: ejecuta train.py, recarga datos en memoria,
-    y hace git push para activar redeploy de Render.
-    """
-    _training_state["status"] = "running"
-    _training_state["started_at"] = datetime.now(timezone.utc).isoformat()
-    _training_state["message"] = "Ejecutando entrenamiento LightGBM v2.0..."
-    _training_state["error"] = None
-    _training_state["result"] = None
-
-    try:
-        # ── Paso 1: Ejecutar train.py ────────────────────────────────
-        _training_state["message"] = "Entrenando 480 modelos LightGBM (~2.5 min)..."
-        print("[retrain] Iniciando train.py ...")
-
-        result = subprocess.run(
-            ["python", "train.py"],
-            capture_output=True, text=True, timeout=600,
-        )
-
-        if result.returncode != 0:
-            error_msg = result.stderr[-500:] if result.stderr else result.stdout[-500:]
-            raise RuntimeError(f"train.py falló (exit {result.returncode}): {error_msg}")
-
-        print(f"[retrain] train.py completado")
-
-        # ── Paso 2: Leer métricas generadas ──────────────────────────
-        _training_state["message"] = "Leyendo métricas del modelo..."
-        metrics_result = {"grades": {"A": 0, "B": 0, "C": 0, "D": 0}}
-
-        try:
-            with open("data/model_metrics.csv", newline='', encoding='utf-8') as f:
-                mapes = []
-                for r in csv.DictReader(f):
-                    mape = _float(r.get('mape'), 999)
-                    mapes.append(mape)
-                    g = ("A" if mape <= 25 else "B" if mape <= 50 else "C" if mape <= 100 else "D")
-                    metrics_result["grades"][g] += 1
-                if mapes:
-                    valid = sorted([m for m in mapes if m < 500])
-                    metrics_result["mape_median"] = round(valid[len(valid)//2], 1) if valid else None
-                    metrics_result["mape_mean"] = round(sum(valid)/len(valid), 1) if valid else None
-                    metrics_result["products_trained"] = len(mapes)
-        except Exception as e:
-            print(f"[retrain] Advertencia leyendo métricas: {e}")
-
-        # ── Paso 3: Recargar datos en memoria ────────────────────────
-        _training_state["message"] = "Recargando datos en memoria..."
-        _reload_data()
-        gc.collect()
-
-        # ── Paso 4: Git commit + push ────────────────────────────────
-        _training_state["message"] = "Guardando resultados en GitHub..."
-        token = os.environ.get("GITHUB_TOKEN", "")
-
-        if token:
-            try:
-                subprocess.run(["git", "config", "user.email", "supplypredict@toyo.foods"], check=True)
-                subprocess.run(["git", "config", "user.name", "SupplyPredict Bot"], check=True)
-                subprocess.run(["git", "add",
-                    "data/predictions.pkl", "data/model_metrics.csv", "data/reorder_points.csv",
-                ], check=True)
-
-                diff = subprocess.run(["git", "diff", "--cached", "--quiet"])
-                if diff.returncode != 0:
-                    mape_str = metrics_result.get("mape_median", "?")
-                    subprocess.run(["git", "commit", "-m",
-                        f"auto: retrain MAPE {mape_str}% — "
-                        f"A:{metrics_result['grades']['A']} "
-                        f"B:{metrics_result['grades']['B']} "
-                        f"C:{metrics_result['grades']['C']} "
-                        f"D:{metrics_result['grades']['D']}"
-                    ], check=True)
-
-                    push_url = f"https://0242324-cpu:{token}@github.com/0242324-cpu/supplypredict-api.git"
-                    subprocess.run(
-                        ["git", "push", push_url, "main"],
-                        capture_output=True, text=True, timeout=120,
-                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                    )
-                    print("[retrain] Git push exitoso")
-                else:
-                    print("[retrain] Sin cambios para commitear")
-            except Exception as git_err:
-                print(f"[retrain] Git error (no fatal): {git_err}")
-        else:
-            print("[retrain] GITHUB_TOKEN no configurado — skip git push")
-
-        # ── Paso 5: Completado ───────────────────────────────────────
-        _training_state["status"] = "completed"
-        _training_state["finished_at"] = datetime.now(timezone.utc).isoformat()
-        _training_state["message"] = "Reentrenamiento completado exitosamente"
-        _training_state["result"] = metrics_result
-        print(f"[retrain] ✅ Completado: MAPE {metrics_result.get('mape_median')}%")
-
-    except Exception as e:
-        _training_state["status"] = "error"
-        _training_state["finished_at"] = datetime.now(timezone.utc).isoformat()
-        _training_state["message"] = f"Error: {str(e)}"
-        _training_state["error"] = traceback.format_exc()[-500:]
-        print(f"[retrain] ❌ Error: {e}")
-
-
+# ── /upload-sales — recibir CSV de ventas y actualizar nombres ───────
 @app.post("/upload-sales")
-async def upload_sales(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    retrain: bool = Query(default=False),
-):
+async def upload_sales(file: UploadFile = File(...)):
     global _product_names
 
     if not file.filename.endswith('.csv'):
         return JSONResponse(status_code=400, content={"detail": "Solo se aceptan archivos .csv"})
-
-    if retrain and _training_state["status"] == "running":
-        return JSONResponse(status_code=409, content={
-            "detail": "Ya hay un entrenamiento en curso. Espera a que termine.",
-            "training_status": _training_state["status"],
-        })
 
     try:
         content = await file.read()
@@ -526,11 +406,12 @@ async def upload_sales(
 
         with open(NAMES_PATH, "w", encoding="utf-8") as f:
             json.dump(_product_names, f, ensure_ascii=False, indent=2)
+        print(f"✓ product_names actualizado: {len(_product_names)} total, {names_updated} nuevos/cambios")
 
         existing_ids = set(_products_index.keys())
         uploaded_ids = set(new_names.keys())
 
-        response = {
+        return {
             "status":              "ok",
             "products_processed":  len(new_names),
             "names_updated":       names_updated,
@@ -538,36 +419,6 @@ async def upload_sales(
             "unmatched":           len(uploaded_ids - existing_ids),
             "total_names_in_system": len(_product_names),
             "file":                file.filename,
-            "retrain_started":     False,
         }
-
-        if retrain:
-            _reset_training_state()
-            _training_state["status"] = "queued"
-            _training_state["message"] = "Entrenamiento en cola..."
-            background_tasks.add_task(_run_retrain_pipeline)
-            response["retrain_started"] = True
-            response["message"] = "Datos procesados. Reentrenamiento iniciado en background (~2.5 min)."
-
-        return response
-
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"Error procesando archivo: {str(e)}"})
-
-
-@app.get("/training-status")
-def training_status():
-    """Retorna el estado del entrenamiento. Frontend hace polling cada 10s."""
-    return {
-        "status":      _training_state["status"],
-        "started_at":  _training_state["started_at"],
-        "finished_at": _training_state["finished_at"],
-        "message":     _training_state["message"],
-        "result":      _training_state["result"],
-        "error":       _training_state["error"],
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
